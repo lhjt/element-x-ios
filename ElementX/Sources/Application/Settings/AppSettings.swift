@@ -20,6 +20,7 @@ nonisolated protocol CommonSettingsProtocol: AnyObject, Sendable {
     var lastNotificationBootTime: TimeInterval? { get set }
     var selectedNotificationTone: NotificationTone? { get set }
     var mainAppActivityState: MainAppActivityState { get set }
+    var mainAppActivityStateLastUpdatedSystemUptime: TimeInterval? { get set }
     
     var logLevel: LogLevel { get }
     var traceLogPacks: Set<TraceLogPack> { get }
@@ -37,9 +38,33 @@ nonisolated enum MainAppActivityState: String, Codable, Sendable {
     case inactive
     case background
     case terminated
+}
+
+nonisolated struct NotificationExtensionPresencePolicy: Sendable {
+    static let foregroundActiveMaximumAge: TimeInterval = 30
+    static let foregroundActiveRefreshInterval = foregroundActiveMaximumAge / 2
     
-    var shouldNotificationExtensionForceOfflinePresence: Bool {
-        self != .foregroundActive
+    let mainAppActivityState: MainAppActivityState
+    let mainAppActivityStateLastUpdatedSystemUptime: TimeInterval?
+    
+    init(mainAppActivityState: MainAppActivityState, mainAppActivityStateLastUpdatedSystemUptime: TimeInterval?) {
+        self.mainAppActivityState = mainAppActivityState
+        self.mainAppActivityStateLastUpdatedSystemUptime = mainAppActivityStateLastUpdatedSystemUptime
+    }
+    
+    init(appSettings: CommonSettingsProtocol) {
+        self.init(mainAppActivityState: appSettings.mainAppActivityState,
+                  mainAppActivityStateLastUpdatedSystemUptime: appSettings.mainAppActivityStateLastUpdatedSystemUptime)
+    }
+    
+    func shouldForceOfflinePresence(currentSystemUptime: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        guard mainAppActivityState == .foregroundActive,
+              let mainAppActivityStateLastUpdatedSystemUptime,
+              currentSystemUptime >= mainAppActivityStateLastUpdatedSystemUptime else {
+            return true
+        }
+        
+        return currentSystemUptime - mainAppActivityStateLastUpdatedSystemUptime > Self.foregroundActiveMaximumAge
     }
 }
 
@@ -267,6 +292,10 @@ final nonisolated class AppSettings: @unchecked Sendable {
     @UserPreference(defaultValue: MainAppActivityState.terminated)
     var mainAppActivityState: MainAppActivityState
     
+    /// System uptime for the last main app activity state update.
+    @UserPreference
+    var mainAppActivityStateLastUpdatedSystemUptime: TimeInterval?
+    
     // MARK: - Logging
     
     @UserPreference(defaultValue: LogLevel.info)
@@ -438,6 +467,11 @@ final nonisolated class AppSettings: @unchecked Sendable {
     
     init(store: UserDefaultsProtocol) {
         self.store = store
+    }
+    
+    func updateMainAppActivityState(_ state: MainAppActivityState, systemUptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        mainAppActivityState = state
+        mainAppActivityStateLastUpdatedSystemUptime = systemUptime
     }
     
     static func volatile() -> AppSettings {

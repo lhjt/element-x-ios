@@ -131,6 +131,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
     private var appDelegateObserver: AnyCancellable?
     private var userSessionObserver: AnyCancellable?
     private var clientProxyObserver: AnyCancellable?
+    private var foregroundActivityStateRefreshCancellable: AnyCancellable?
     private var cancellables = Set<AnyCancellable>()
     
     let windowManager: SecureWindowManagerProtocol
@@ -160,7 +161,6 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
         }
         let appSettings = appHooks.appSettingsHook.configure(AppSettings(store: userDefaults))
         self.appSettings = appSettings
-        appSettings.mainAppActivityState = appMediator.appState.mainAppActivityState
         
         targetConfiguration = Target.mainApp.configure(logLevel: appSettings.logLevel,
                                                        traceLogPacks: appSettings.traceLogPacks,
@@ -281,6 +281,8 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
             windowManager?.secondaryWindowsEnabled = !appLockEnabled
         }
         .store(in: &cancellables)
+        
+        updateSharedMainAppActivityState(appMediator.appState.mainAppActivityState)
     }
     
     func start() {
@@ -1202,14 +1204,14 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
     @objc
     private func applicationWillTerminate() {
         MXLog.info("Application will terminate")
-        appSettings.mainAppActivityState = .terminated
+        updateSharedMainAppActivityState(.terminated)
         Task { await pauseClientServices(mode: AppCoordinatorClientServiceModeResolver.backgroundPauseMode(), isBackgroundTask: false) }
     }
     
     @objc
     private func applicationDidEnterBackground() {
         MXLog.info("Application did enter background")
-        appSettings.mainAppActivityState = .background
+        updateSharedMainAppActivityState(.background)
         
         scheduleDelayedPauseServices()
         scheduleBackgroundAppRefresh()
@@ -1222,7 +1224,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
     @objc
     private func applicationWillResignActive() {
         MXLog.info("Application will resign active")
-        appSettings.mainAppActivityState = .inactive
+        updateSharedMainAppActivityState(.inactive)
         Task {
             await updateClientServiceMode(AppCoordinatorClientServiceModeResolver.inactiveModeUpdate())
         }
@@ -1255,7 +1257,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
     @objc
     private func applicationDidBecomeActive() {
         MXLog.info("Application did become active")
-        appSettings.mainAppActivityState = .foregroundActive
+        updateSharedMainAppActivityState(.foregroundActive)
         Task {
             await resumeClientServices(mode: AppCoordinatorClientServiceModeResolver.activeForegroundResumeMode())
         }
@@ -1356,6 +1358,36 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
 }
 
 private extension AppCoordinator {
+    func updateSharedMainAppActivityState(_ state: MainAppActivityState) {
+        appSettings.updateMainAppActivityState(state)
+        
+        switch state {
+        case .foregroundActive:
+            startForegroundActivityStateRefresh()
+        case .inactive, .background, .terminated:
+            stopForegroundActivityStateRefresh()
+        }
+    }
+    
+    func startForegroundActivityStateRefresh() {
+        guard foregroundActivityStateRefreshCancellable == nil else {
+            return
+        }
+        
+        foregroundActivityStateRefreshCancellable = Timer.publish(every: NotificationExtensionPresencePolicy.foregroundActiveRefreshInterval,
+                                                                  on: .main,
+                                                                  in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                self?.appSettings.updateMainAppActivityState(.foregroundActive)
+            }
+    }
+    
+    func stopForegroundActivityStateRefresh() {
+        foregroundActivityStateRefreshCancellable?.cancel()
+        foregroundActivityStateRefreshCancellable = nil
+    }
+    
     func pauseClientServices(mode: ClientServiceRunMode, isBackgroundTask: Bool) async {
         if isBackgroundTask, UIApplication.shared.applicationState == .active {
             // Attempt to pause the background task services cleanly, only if the app not already running

@@ -392,12 +392,16 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
             return
         }
         
+        let didResumeBackgroundServices = await resumeServicesForBackgroundWorkIfNeeded()
+        
         guard case let .joined(roomProxy) = await clientProxy.roomForIdentifier(incomingCallID.roomID) else {
             MXLog.warning("Failed to fetch a joined room for the incoming call.")
+            await pauseServicesAfterBackgroundWorkIfNeeded(didResumeBackgroundServices)
             return
         }
         
         _ = await roomProxy.declineCall(notificationID: rtcNotificationID)
+        await pauseServicesAfterBackgroundWorkIfNeeded(didResumeBackgroundServices)
     }
     
     private func observeIncomingCall() async {
@@ -412,6 +416,8 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
             MXLog.warning("A ClientProxy is needed to fetch the room.")
             return
         }
+        
+        await resumeServicesForBackgroundWorkIfNeeded()
         
         guard case let .joined(roomProxy) = await clientProxy.roomForIdentifier(incomingCallID.roomID) else {
             MXLog.warning("Failed to fetch a joined room for the incoming call.")
@@ -473,6 +479,25 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
     private func reportEndedCall(incomingCallID: CallID, reason: CXCallEndedReason) {
         callProvider.reportCall(with: incomingCallID.callKitID, endedAt: nil, reason: reason)
         clearIncomingCallState()
+    }
+    
+    @discardableResult
+    private func resumeServicesForBackgroundWorkIfNeeded() async -> Bool {
+        guard UIApplication.shared.applicationState != .active,
+              let clientProxy else {
+            return false
+        }
+        
+        await clientProxy.resumeServices(mode: .backgroundSync)
+        return true
+    }
+    
+    private func pauseServicesAfterBackgroundWorkIfNeeded(_ didResumeBackgroundServices: Bool) async {
+        guard didResumeBackgroundServices, UIApplication.shared.applicationState != .active else {
+            return
+        }
+        
+        await clientProxy?.pauseServices(mode: .backgroundGrace)
     }
     
     /// Cancels every subscription and task tied to a ringing incoming call and nils `incomingCallID`.

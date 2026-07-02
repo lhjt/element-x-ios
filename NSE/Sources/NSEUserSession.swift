@@ -133,7 +133,8 @@ final nonisolated class NSEUserSession: NSEUserSessionProtocol {
     }
     
     private static func setOfflinePresenceIfNeeded(on client: Client, appSettings: CommonSettingsProtocol) async {
-        guard appSettings.mainAppActivityState.shouldNotificationExtensionForceOfflinePresence else {
+        let presencePolicy = NotificationExtensionPresencePolicy(appSettings: appSettings)
+        guard presencePolicy.shouldForceOfflinePresence() else {
             return
         }
         

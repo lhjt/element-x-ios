@@ -10,6 +10,7 @@ import CoreLocation
 @testable import ElementX
 import Foundation
 import Testing
+import UIKit
 
 @MainActor
 final class LiveLocationManagerTests {
@@ -197,6 +198,68 @@ final class LiveLocationManagerTests {
         #expect(appSettings.liveLocationSharingSessionsByRoomID["!room:matrix.org"] == nil)
     }
     
+    // MARK: - Location updates
+    
+    @Test
+    func locationUpdateInBackgroundResumesServicesUsingBackgroundSyncBeforeSending() async throws {
+        setUp(appState: .background)
+        let roomID = "!room:matrix.org"
+        let roomProxy = makeRoomProxy(roomID: roomID)
+        clientProxy.roomForIdentifierClosure = { _ in .joined(roomProxy) }
+        appSettings.liveLocationSharingSessionsByRoomID[roomID] = LiveLocationSession(eventID: "$event:matrix.org", expirationDate: Date().addingTimeInterval(300))
+        
+        let sendSubject = PassthroughSubject<Void, Never>()
+        let pauseSubject = PassthroughSubject<ClientServiceRunMode, Never>()
+        let sendDeferred = deferFulfillment(sendSubject) { true }
+        let pauseDeferred = deferFulfillment(pauseSubject) { $0 == .backgroundGrace }
+        var callOrder = [LocationSendStep]()
+        
+        clientProxy.resumeServicesModeClosure = { mode in
+            callOrder.append(.resume(mode))
+        }
+        roomProxy.sendLiveLocationGeoURIClosure = { _ in
+            callOrder.append(.send)
+            sendSubject.send()
+            return .success(())
+        }
+        clientProxy.pauseServicesModeClosure = { mode in
+            callOrder.append(.pause(mode))
+            pauseSubject.send(mode)
+        }
+        
+        manager.locationManager(CLLocationManager(), didUpdateLocations: [CLLocation(latitude: 1.2, longitude: 3.4)])
+        
+        try await sendDeferred.fulfill()
+        try await pauseDeferred.fulfill()
+        
+        #expect(clientProxy.resumeServicesModeReceivedInvocations == [.backgroundSync])
+        #expect(clientProxy.pauseServicesModeReceivedInvocations == [.backgroundGrace])
+        #expect(callOrder == [.resume(.backgroundSync), .send, .pause(.backgroundGrace)])
+    }
+    
+    @Test
+    func locationUpdateInForegroundDoesNotResumeServices() async throws {
+        setUp(appState: .active)
+        let roomID = "!room:matrix.org"
+        let roomProxy = makeRoomProxy(roomID: roomID)
+        clientProxy.roomForIdentifierClosure = { _ in .joined(roomProxy) }
+        appSettings.liveLocationSharingSessionsByRoomID[roomID] = LiveLocationSession(eventID: "$event:matrix.org", expirationDate: Date().addingTimeInterval(300))
+        
+        let sendSubject = PassthroughSubject<Void, Never>()
+        let sendDeferred = deferFulfillment(sendSubject) { true }
+        roomProxy.sendLiveLocationGeoURIClosure = { _ in
+            sendSubject.send()
+            return .success(())
+        }
+        
+        manager.locationManager(CLLocationManager(), didUpdateLocations: [CLLocation(latitude: 1.2, longitude: 3.4)])
+        
+        try await sendDeferred.fulfill()
+        
+        #expect(clientProxy.resumeServicesModeReceivedInvocations.isEmpty)
+        #expect(clientProxy.pauseServicesModeReceivedInvocations.isEmpty)
+    }
+    
     // MARK: - Reduced accuracy
     
     @Test
@@ -224,21 +287,31 @@ final class LiveLocationManagerTests {
         let roomProxy = JoinedRoomProxyMock(.init(id: roomID))
         roomProxy.startLiveLocationShareDurationReturnValue = .success("$event:matrix.org")
         roomProxy.stopLiveLocationShareReturnValue = .success(())
+        roomProxy.sendLiveLocationGeoURIReturnValue = .success(())
         return roomProxy
     }
     
-    private func setUp(accuracyAuthorization: CLAccuracyAuthorization = .fullAccuracy) {
+    private func setUp(accuracyAuthorization: CLAccuracyAuthorization = .fullAccuracy,
+                       appState: UIApplication.State = .active) {
         appSettings = AppSettings.volatile()
         clientProxy = ClientProxyMock(.init())
         beaconInfoSubject = PassthroughSubject<LiveLocationOwnInfoUpdate, Never>()
         clientProxy.liveLocationOwnInfoUpdatesPublisher = beaconInfoSubject.eraseToAnyPublisher()
         locationManagerMock = CLLocationManagerMock(.init(accuracyAuthorization: accuracyAuthorization))
-        manager = LiveLocationManager(clientProxy: clientProxy, appSettings: appSettings, locationManager: locationManagerMock)
+        manager = LiveLocationManager(clientProxy: clientProxy, appSettings: appSettings, locationManager: locationManagerMock) {
+            appState
+        }
     }
     
     private func simulateBeaconEcho(roomID: String, eventID: String) async throws {
         let deferred = deferFulfillment(appSettings.liveLocationSharingSessionsByRoomIDPublisher) { $0[roomID] != nil }
         beaconInfoSubject.send(LiveLocationOwnInfoUpdate(roomID: roomID, eventID: eventID, isLive: true))
         try await deferred.fulfill()
+    }
+    
+    private enum LocationSendStep: Equatable {
+        case resume(ClientServiceRunMode)
+        case send
+        case pause(ClientServiceRunMode)
     }
 }

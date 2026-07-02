@@ -163,6 +163,8 @@ final class NotificationManager: NSObject, NotificationManagerProtocol {
     }
     
     private func setPusher(with deviceToken: Data, clientProxy: ClientProxyProtocol) async -> Bool {
+        let didResumeBackgroundServices = await resumeServicesForBackgroundWorkIfNeeded(clientProxy: clientProxy)
+        
         do {
             let defaultPayload = APNSPayload(aps: APSInfo(mutableContent: 1,
                                                           alert: APSAlert(locKey: "Notification",
@@ -179,12 +181,31 @@ final class NotificationManager: NSObject, NotificationManagerProtocol {
                                                         profileTag: pusherProfileTag(),
                                                         lang: Bundle.app.preferredLocalizations.first ?? "en")
             try await clientProxy.setPusher(with: configuration)
+            await pauseServicesAfterBackgroundWorkIfNeeded(didResumeBackgroundServices, clientProxy: clientProxy)
             MXLog.info("Set pusher succeeded")
             return true
         } catch {
+            await pauseServicesAfterBackgroundWorkIfNeeded(didResumeBackgroundServices, clientProxy: clientProxy)
             MXLog.error("Set pusher failed: \(error)")
             return false
         }
+    }
+    
+    private func resumeServicesForBackgroundWorkIfNeeded(clientProxy: ClientProxyProtocol) async -> Bool {
+        guard UIApplication.shared.applicationState != .active else {
+            return false
+        }
+        
+        await clientProxy.resumeServices(mode: .backgroundSync)
+        return true
+    }
+    
+    private func pauseServicesAfterBackgroundWorkIfNeeded(_ didResumeBackgroundServices: Bool, clientProxy: ClientProxyProtocol) async {
+        guard didResumeBackgroundServices, UIApplication.shared.applicationState != .active else {
+            return
+        }
+        
+        await clientProxy.pauseServices(mode: .backgroundGrace)
     }
     
     private func pusherProfileTag() -> String {

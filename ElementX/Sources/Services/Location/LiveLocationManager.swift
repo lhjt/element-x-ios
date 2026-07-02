@@ -7,11 +7,13 @@
 
 import Combine
 import CoreLocation
+import UIKit
 
 class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationManagerDelegate {
     private let clientProxy: ClientProxyProtocol
     private let locationManager: CLLocationManagerProtocol
     private let appSettings: AppSettings
+    private let applicationState: () -> UIApplication.State
     
     private let authorizationStatusSubject: CurrentValueSubject<CLAuthorizationStatus, Never>
     var authorizationStatus: CurrentValuePublisher<CLAuthorizationStatus, Never> {
@@ -43,9 +45,11 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
     
     init(clientProxy: ClientProxyProtocol,
          appSettings: AppSettings,
-         locationManager: @autoclosure @MainActor () -> CLLocationManagerProtocol = CLLocationManager()) {
+         locationManager: @autoclosure @MainActor () -> CLLocationManagerProtocol = CLLocationManager(),
+         applicationState: @escaping () -> UIApplication.State = { UIApplication.shared.applicationState }) {
         self.clientProxy = clientProxy
         self.appSettings = appSettings
+        self.applicationState = applicationState
         // Very important, the CLLocationManager needs to be initialised on the main thread
         // or the delegate functions won't be handled!
         // https://developer.apple.com/documentation/corelocation/cllocationmanagerdelegate
@@ -111,6 +115,16 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
     }
     
     func stopLiveLocation(roomID: String) async {
+        await stopLiveLocation(roomID: roomID, managesBackgroundServices: true)
+    }
+    
+    private func stopLiveLocation(roomID: String, managesBackgroundServices: Bool) async {
+        let didResumeBackgroundServices = if managesBackgroundServices {
+            await resumeServicesForBackgroundSendIfNeeded()
+        } else {
+            false
+        }
+        
         var roomProxy: JoinedRoomProxyProtocol?
         let cachedRoomProxy = activeRoomProxies[roomID]
         startingLiveLocationSharingSessionsByRoomID.removeValue(forKey: roomID)
@@ -129,6 +143,8 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
                 MXLog.error("Failed to stop live location share in room \(roomID): \(error)")
             }
         }
+        
+        await pauseServicesAfterBackgroundSendIfNeeded(didResumeBackgroundServices)
     }
     
     // MARK: - CLLocationManagerDelegate
@@ -307,12 +323,15 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
     
     private func sendLocationToActiveRooms(_ coordinate: CLLocationCoordinate2D) async {
         let sessions = appSettings.liveLocationSharingSessionsByRoomID
+        guard !sessions.isEmpty else { return }
+        
+        let didResumeBackgroundServices = await resumeServicesForBackgroundSendIfNeeded()
         let geoURI = GeoURI(coordinate: coordinate, uncertainty: nil)
         
         for (roomID, session) in sessions {
             if Date() >= session.expirationDate {
                 MXLog.info("Live location session expired for room: \(roomID)")
-                await stopLiveLocation(roomID: roomID)
+                await stopLiveLocation(roomID: roomID, managesBackgroundServices: false)
                 continue
             }
             
@@ -329,12 +348,14 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
                 switch error {
                 case .liveLocationSessionIsNotActive:
                     MXLog.error("Failed to send live location update to room \(roomID): session not active")
-                    await stopLiveLocation(roomID: roomID)
+                    await stopLiveLocation(roomID: roomID, managesBackgroundServices: false)
                 default:
                     MXLog.error("Failed to send live location update to room \(roomID): \(error)")
                 }
             }
         }
+        
+        await pauseServicesAfterBackgroundSendIfNeeded(didResumeBackgroundServices)
     }
     
     private func resolveRoomProxy(for roomID: String) async -> JoinedRoomProxyProtocol? {
@@ -348,6 +369,19 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
         
         activeRoomProxies[roomID] = roomProxy
         return roomProxy
+    }
+    
+    private func resumeServicesForBackgroundSendIfNeeded() async -> Bool {
+        guard applicationState() != .active else { return false }
+        
+        await clientProxy.resumeServices(mode: .backgroundSync)
+        return true
+    }
+    
+    private func pauseServicesAfterBackgroundSendIfNeeded(_ didResumeBackgroundServices: Bool) async {
+        guard didResumeBackgroundServices, applicationState() != .active else { return }
+        
+        await clientProxy.pauseServices(mode: .backgroundGrace)
     }
     
     private func stopAllSessions() {
