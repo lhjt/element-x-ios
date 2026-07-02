@@ -19,6 +19,7 @@ import SwiftUI
 nonisolated protocol CommonSettingsProtocol: AnyObject, Sendable {
     var lastNotificationBootTime: TimeInterval? { get set }
     var selectedNotificationTone: NotificationTone? { get set }
+    var mainAppActivityState: MainAppActivityState { get set }
     
     var logLevel: LogLevel { get }
     var traceLogPacks: Set<TraceLogPack> { get }
@@ -29,6 +30,17 @@ nonisolated protocol CommonSettingsProtocol: AnyObject, Sendable {
     var threadsEnabled: Bool { get }
     var globalSearchEnabled: Bool { get }
     var hideQuietNotificationAlerts: Bool { get }
+}
+
+nonisolated enum MainAppActivityState: String, Codable, Sendable {
+    case foregroundActive
+    case inactive
+    case background
+    case terminated
+    
+    var shouldNotificationExtensionForceOfflinePresence: Bool {
+        self != .foregroundActive
+    }
 }
 
 nonisolated enum AppBuildType {
@@ -250,6 +262,10 @@ final nonisolated class AppSettings: @unchecked Sendable {
     /// The sound played when delivering noisy notifications. If nil, use the ElementX default
     @UserPreference
     var selectedNotificationTone: NotificationTone?
+    
+    /// Shared with the NSE so it can avoid forcing offline presence while the main app owns foreground presence.
+    @UserPreference(defaultValue: MainAppActivityState.terminated)
+    var mainAppActivityState: MainAppActivityState
     
     // MARK: - Logging
     

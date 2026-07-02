@@ -25,9 +25,7 @@ final nonisolated class NSEUserSession: NSEUserSessionProtocol {
     private let baseClient: Client
     private let notificationClient: NotificationClient
     private let userID: String
-    private(set) lazy var mediaProvider: MediaProviderProtocol = MediaProvider(mediaLoader: MediaLoader(client: baseClient),
-                                                                               imageCache: .onlyOnDisk,
-                                                                               homeserverReachabilityPublisher: nil)
+    let mediaProvider: MediaProviderProtocol
     private let delegateHandle: TaskHandle?
     
     var mediaPreviewVisibility: MediaPreviews {
@@ -84,16 +82,23 @@ final nonisolated class NSEUserSession: NSEUserSessionProtocol {
             .homeserverUrl(url: homeserverURL)
         
         baseClient = try await clientBuilder.build()
+        mediaProvider = MediaProvider(mediaLoader: MediaLoader(client: baseClient),
+                                      imageCache: .onlyOnDisk,
+                                      homeserverReachabilityPublisher: nil)
         delegateHandle = try baseClient.setDelegate(delegate: ClientDelegateWrapper())
         
         try await baseClient.restoreSessionWith(session: credentials.restorationToken.session,
                                                 roomLoadSettings: .one(roomId: roomID))
+        
+        await Self.setOfflinePresenceIfNeeded(on: baseClient, appSettings: appSettings)
         
         notificationClient = try await baseClient.notificationClient(processSetup: .multipleProcesses)
     }
     
     func notificationItemProxy(roomID: String, eventID: String) async -> NotificationItemProxyProtocol? {
         do {
+            await Self.setOfflinePresenceIfNeeded(on: baseClient, appSettings: appSettings)
+            
             let notificationStatus = try await notificationClient.getNotification(roomId: roomID, eventId: eventID)
             
             switch notificationStatus {
@@ -124,6 +129,18 @@ final nonisolated class NSEUserSession: NSEUserSessionProtocol {
         } catch {
             MXLog.error("Failed retrieving room with error: \(error)")
             return nil
+        }
+    }
+    
+    private static func setOfflinePresenceIfNeeded(on client: Client, appSettings: CommonSettingsProtocol) async {
+        guard appSettings.mainAppActivityState.shouldNotificationExtensionForceOfflinePresence else {
+            return
+        }
+        
+        do {
+            try await client.setPresence(presence: .offline, immediate: true)
+        } catch {
+            MXLog.error("Failed setting offline presence before notification processing with error: \(error)")
         }
     }
     

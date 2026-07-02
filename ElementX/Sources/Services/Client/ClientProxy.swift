@@ -14,10 +14,13 @@ import OrderedCollections
 
 // swiftlint:disable:next type_body_length
 class ClientProxy: ClientProxyProtocol {
+    private static let defaultRestartServicesDelay: Duration = .milliseconds(250)
+    
     private let client: ClientProtocol
     private let networkMonitor: NetworkMonitorProtocol
     private let appSettings: AppSettings
     private let analyticsService: AnalyticsServiceProtocol
+    private let restartServicesDelay: Duration
     
     let mediaLoader: MediaLoaderProtocol
     private let clientQueue: DispatchQueue
@@ -207,11 +210,13 @@ class ClientProxy: ClientProxyProtocol {
     init(client: ClientProtocol,
          networkMonitor: NetworkMonitorProtocol,
          appSettings: AppSettings,
-         analyticsService: AnalyticsServiceProtocol) async throws {
+         analyticsService: AnalyticsServiceProtocol,
+         restartServicesDelay: Duration = ClientProxy.defaultRestartServicesDelay) async throws {
         self.client = client
         self.networkMonitor = networkMonitor
         self.appSettings = appSettings
         self.analyticsService = analyticsService
+        self.restartServicesDelay = restartServicesDelay
         
         if appSettings.automaticBackPaginationEnabled {
             // Must be called before creating the sync service, timelines etc.
@@ -397,7 +402,7 @@ class ClientProxy: ClientProxyProtocol {
         }
     }
     
-    func resumeServices() async {
+    func resumeServices(mode: ClientServiceRunMode) async {
         MXLog.info("Resuming services")
         
         guard !hasEncounteredAuthError else {
@@ -405,12 +410,22 @@ class ClientProxy: ClientProxyProtocol {
             return
         }
         
+        let serviceState: ServiceState
+        if mode == .backgroundGrace {
+            // Background grace may keep an existing sync alive, but must not start new background work.
+            serviceState = currentServiceState.withRunMode(mode)
+        } else {
+            serviceState = .running(mode)
+        }
+        
+        desiredServiceState = serviceState
+        
         guard networkMonitor.reachabilityPublisher.value == .reachable else {
             MXLog.warning("Ignoring request, network unreachable.")
             return
         }
         
-        await transitionServices(to: .running).value
+        await transitionServices(to: serviceState).value
     }
     
     /// A stored task for restarting the sync after a failure. This is stored so that we can cancel
@@ -422,26 +437,51 @@ class ClientProxy: ClientProxyProtocol {
         guard restartTask == nil else { return }
         
         restartTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.restartTask = nil }
+            
             do {
                 // Until the SDK can tell us the failure, we add a small
                 // delay to avoid generating multi-gigabyte log files.
-                try await Task.sleep(for: .milliseconds(250))
-                await self?.resumeServices()
+                try await Task.sleep(for: restartServicesDelay)
+                guard desiredServiceState.isRunning else {
+                    return
+                }
+                
+                guard !hasEncounteredAuthError, networkMonitor.reachabilityPublisher.value == .reachable else {
+                    return
+                }
+                
+                let runMode = desiredServiceState.runMode
+                currentServiceState = .suspended(runMode)
+                await transitionServices(to: .running(runMode)).value
             } catch {
                 MXLog.error("Restart cancelled.")
             }
-            self?.restartTask = nil
         }
     }
     
-    func pauseServices() async {
+    func pauseServices(mode: ClientServiceRunMode) async {
         MXLog.info("Pausing services")
         
         if restartTask != nil {
             restartTask = nil
         }
         
-        await transitionServices(to: .suspended).value
+        await transitionServices(to: .suspended(mode)).value
+    }
+    
+    func updateServiceMode(_ mode: ClientServiceRunMode) async {
+        MXLog.info("Updating service mode")
+        
+        let serviceState: ServiceState
+        if mode == .backgroundGrace {
+            serviceState = currentServiceState.withRunMode(mode)
+        } else {
+            serviceState = desiredServiceState.withRunMode(mode)
+        }
+        
+        await transitionServices(to: serviceState).value
     }
     
     func expireSyncSessions() async {
@@ -1001,9 +1041,10 @@ class ClientProxy: ClientProxyProtocol {
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] reachability in
-                if reachability == .reachable {
+                if reachability == .reachable, self?.desiredServiceState.isRunning == true {
                     Task {
-                        await self?.resumeServices()
+                        guard let self else { return }
+                        await self.resumeServices(mode: self.desiredServiceState.runMode)
                     }
                 }
             }
@@ -1042,7 +1083,7 @@ class ClientProxy: ClientProxyProtocol {
                 
                 // Don't restart the send queue unless the client is meant to be running; doing so while
                 // suspended would generate network activity in the window we paused to keep quiet.
-                if enabled == false, reachability == .reachable, self?.desiredServiceState == .running {
+                if enabled == false, reachability == .reachable, self?.desiredServiceState.isRunning == true {
                     MXLog.info("Enabling all send queues")
                     Task {
                         await client.enableAllSendQueues(enable: true)
@@ -1058,14 +1099,79 @@ class ClientProxy: ClientProxyProtocol {
                 Task { await self?.capabilities.refresh() }
             }
             .store(in: &cancellables)
+        
+        appSettings.sharePresencePublisher
+            .dropFirst()
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] sharePresence in
+                guard let self else { return }
+                Task {
+                    self.forceImmediatePresenceUpdate = !sharePresence
+                    await self.transitionServices(to: self.desiredServiceState).value
+                }
+            }
+            .store(in: &cancellables)
     }
     
     // MARK: - Pausing and resuming
     
-    private enum ServiceState { case running, suspended }
+    private enum ClientPresence {
+        case online
+        case unavailable
+        case offline
+        
+        var rustValue: PresenceState {
+            switch self {
+            case .online:
+                .online
+            case .unavailable:
+                .unavailable
+            case .offline:
+                .offline
+            }
+        }
+    }
     
-    /// The state the sync service and client *should* be in, updated by ``resumeServices()`` and ``pauseServices()``.
-    private var desiredServiceState: ServiceState = .suspended
+    private struct PresenceUpdate {
+        let presence: ClientPresence
+        let sendImmediately: Bool
+    }
+    
+    private enum ServiceState: Equatable {
+        case running(ClientServiceRunMode)
+        case suspended(ClientServiceRunMode)
+        
+        var isRunning: Bool {
+            switch self {
+            case .running:
+                true
+            case .suspended:
+                false
+            }
+        }
+        
+        var runMode: ClientServiceRunMode {
+            switch self {
+            case .running(let mode), .suspended(let mode):
+                mode
+            }
+        }
+        
+        func withRunMode(_ mode: ClientServiceRunMode) -> ServiceState {
+            switch self {
+            case .running:
+                .running(mode)
+            case .suspended:
+                .suspended(mode)
+            }
+        }
+    }
+    
+    /// The state the sync service and client *should* be in, updated by ``resumeServices(mode:)`` and ``pauseServices(mode:)``.
+    private var desiredServiceState: ServiceState = .suspended(.backgroundGrace)
+    private var currentServiceState: ServiceState = .suspended(.backgroundGrace)
+    private var forceImmediatePresenceUpdate = false
     
     /// Serialises service state transitions so that pause and resume never interleave. Each request chains onto
     /// the previous one and the reconcile always drives the SDK to the *latest* desired state, so a late background
@@ -1086,8 +1192,30 @@ class ClientProxy: ClientProxyProtocol {
     }
     
     private func reconcileServiceState() async {
+        let desiredServiceState = desiredServiceState
+        let forceImmediatePresenceUpdate = forceImmediatePresenceUpdate
+        self.forceImmediatePresenceUpdate = false
+        
+        let presenceUpdate = presenceUpdate(for: desiredServiceState,
+                                            forceImmediate: forceImmediatePresenceUpdate)
+        await setPresence(presenceUpdate.presence, sendImmediately: presenceUpdate.sendImmediately)
+        
         switch desiredServiceState {
         case .running:
+            if currentServiceState.isRunning {
+                currentServiceState = desiredServiceState
+                updateHomeserverReachability()
+                return
+            }
+            
+            guard desiredServiceState.runMode != .backgroundGrace else {
+                let suspendedServiceState = ServiceState.suspended(desiredServiceState.runMode)
+                self.desiredServiceState = suspendedServiceState
+                currentServiceState = suspendedServiceState
+                updateHomeserverReachability()
+                return
+            }
+            
             if appSettings.clientPausingAndResumingEnabled {
                 do {
                     MXLog.info("Resuming client")
@@ -1097,6 +1225,7 @@ class ClientProxy: ClientProxyProtocol {
                 }
             }
             
+            currentServiceState = desiredServiceState
             MXLog.info("Starting sync")
             await syncService.start()
             
@@ -1110,6 +1239,12 @@ class ClientProxy: ClientProxyProtocol {
             // emit, and the SDK only re-enables queues when client.resume() runs (gated behind the flag).
             sendQueueStatusSubject.send(sendQueueStatusSubject.value)
         case .suspended:
+            guard currentServiceState.isRunning else {
+                currentServiceState = desiredServiceState
+                updateHomeserverReachability()
+                return
+            }
+            
             updateHomeserverReachability()
             
             MXLog.info("Stopping sync")
@@ -1124,6 +1259,39 @@ class ClientProxy: ClientProxyProtocol {
                     MXLog.error("Failed pausing client with error: \(error)")
                 }
             }
+            
+            currentServiceState = desiredServiceState
+        }
+    }
+    
+    private func presenceUpdate(for serviceState: ServiceState, forceImmediate: Bool) -> PresenceUpdate {
+        let update: PresenceUpdate
+        
+        switch (serviceState, appSettings.sharePresence) {
+        case (.running(.foregroundActive), true):
+            update = .init(presence: .online, sendImmediately: false)
+        case (.running(.foregroundActive), false):
+            update = .init(presence: .offline, sendImmediately: false)
+        case (.running(.backgroundSync), _):
+            update = .init(presence: .offline, sendImmediately: true)
+        case (_, true):
+            update = .init(presence: .unavailable, sendImmediately: true)
+        case (_, false):
+            update = .init(presence: .offline, sendImmediately: true)
+        }
+        
+        guard forceImmediate else {
+            return update
+        }
+        
+        return .init(presence: update.presence, sendImmediately: true)
+    }
+    
+    private func setPresence(_ presence: ClientPresence, sendImmediately: Bool) async {
+        do {
+            try await client.setPresence(presence: presence.rustValue, immediate: sendImmediately)
+        } catch {
+            MXLog.error("Failed setting presence with error: \(error)")
         }
     }
     
@@ -1200,7 +1368,7 @@ class ClientProxy: ClientProxyProtocol {
     }
     
     private func updateHomeserverReachability() {
-        let reachability: HomeserverReachability = if desiredServiceState != .running {
+        let reachability: HomeserverReachability = if !desiredServiceState.isRunning {
             .suspended
         } else if syncServiceState == .offline {
             .unreachable

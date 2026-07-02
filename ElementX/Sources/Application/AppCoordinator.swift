@@ -15,6 +15,77 @@ import Sentry
 import SwiftUI
 import Version
 
+enum AppCoordinatorClientServiceModeRequest {
+    case appRoute
+    case inlineReply
+    case manualBackgroundWork
+    case restoredSession(hasPendingStoredInlineReply: Bool)
+}
+
+enum AppCoordinatorClientServiceModeResolver {
+    static func resumeMode(for request: AppCoordinatorClientServiceModeRequest, appState: UIApplication.State) -> ClientServiceRunMode {
+        switch request {
+        case .appRoute:
+            activeOrBackgroundGraceMode(appState: appState)
+        case .inlineReply, .manualBackgroundWork:
+            activeOrBackgroundSyncMode(appState: appState)
+        case .restoredSession(let hasPendingStoredInlineReply):
+            if appState == .active {
+                .foregroundActive
+            } else {
+                hasPendingStoredInlineReply ? .backgroundSync : .backgroundGrace
+            }
+        }
+    }
+    
+    static func backgroundEnteredModeUpdate() -> ClientServiceRunMode {
+        .backgroundGrace
+    }
+    
+    static func inactiveModeUpdate() -> ClientServiceRunMode {
+        .backgroundGrace
+    }
+    
+    static func foregroundEnteredAction() -> ClientServiceRunMode? {
+        nil
+    }
+    
+    static func activeForegroundResumeMode() -> ClientServiceRunMode {
+        .foregroundActive
+    }
+    
+    static func backgroundRefreshResumeMode() -> ClientServiceRunMode {
+        .backgroundSync
+    }
+    
+    static func backgroundPauseMode() -> ClientServiceRunMode {
+        .backgroundGrace
+    }
+    
+    private static func activeOrBackgroundGraceMode(appState: UIApplication.State) -> ClientServiceRunMode {
+        appState == .active ? .foregroundActive : .backgroundGrace
+    }
+    
+    private static func activeOrBackgroundSyncMode(appState: UIApplication.State) -> ClientServiceRunMode {
+        appState == .active ? .foregroundActive : .backgroundSync
+    }
+}
+
+private extension UIApplication.State {
+    var mainAppActivityState: MainAppActivityState {
+        switch self {
+        case .active:
+            .foregroundActive
+        case .inactive:
+            .inactive
+        case .background:
+            .background
+        @unknown default:
+            .inactive
+        }
+    }
+}
+
 class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDelegate, NotificationManagerDelegate, SecureWindowManagerDelegate {
     private let stateMachine: AppCoordinatorStateMachine
     private let navigationRootCoordinator: NavigationRootCoordinator
@@ -41,8 +112,10 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
                 configureElementCallService()
                 configureNotificationManager()
                 observeUserSessionChanges()
+                let restoredSessionServiceRunMode = AppCoordinatorClientServiceModeResolver.resumeMode(for: .restoredSession(hasPendingStoredInlineReply: hasPendingStoredInlineReply),
+                                                                                                       appState: appMediator.appState)
                 Task {
-                    await resumeClientServices()
+                    await resumeClientServices(mode: restoredSessionServiceRunMode)
                     await appHooks.configure(with: userSession)
                 }
             }
@@ -67,6 +140,8 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
     
     private var storedAppRoute: AppRoute?
     @Consumable private var storedInlineReply: (roomID: String, message: String)?
+    // Tracks storedInlineReply without consuming the @Consumable value before post-session setup can send it.
+    private var hasPendingStoredInlineReply = false
     @Consumable private var storedRoomsToAwait: Set<String>?
     
     init(appDelegate: AppDelegate) {
@@ -85,6 +160,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
         }
         let appSettings = appHooks.appSettingsHook.configure(AppSettings(store: userDefaults))
         self.appSettings = appSettings
+        appSettings.mainAppActivityState = appMediator.appState.mainAppActivityState
         
         targetConfiguration = Target.mainApp.configure(logLevel: appSettings.logLevel,
                                                        traceLogPacks: appSettings.traceLogPacks,
@@ -187,9 +263,12 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
                     // When reporting a VoIP call through the CXProvider's `reportNewIncomingVoIPPushPayload`
                     // the UIApplication states don't change and services are neither started nor ran on
                     // a background task. Handle both manually here.
-                    Task {
-                        await self?.resumeClientServices()
-                        self?.scheduleDelayedPauseServices()
+                    Task { [weak self] in
+                        guard let self else { return }
+                        
+                        let mode = AppCoordinatorClientServiceModeResolver.resumeMode(for: .manualBackgroundWork, appState: appMediator.appState)
+                        await resumeClientServices(mode: mode)
+                        scheduleDelayedPauseServices()
                     }
                 default:
                     break
@@ -253,7 +332,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
     private func asyncHandleAppRoute(_ appRoute: AppRoute, windowType: SecondaryWindowType?) async {
         MXLog.info("Handling app route:  \(appRoute)")
         
-        await resumeClientServices()
+        await resumeClientServices(mode: AppCoordinatorClientServiceModeResolver.resumeMode(for: .appRoute, appState: appMediator.appState))
         
         if let windowType {
             windowManager.handleRoute(appRoute, windowType: windowType)
@@ -441,9 +520,11 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
         if userSession == nil {
             // Store the data so it can be used after the session is established
             storedInlineReply = (roomID, replyText)
+            hasPendingStoredInlineReply = true
             return
         }
         
+        await resumeClientServices(mode: AppCoordinatorClientServiceModeResolver.resumeMode(for: .inlineReply, appState: appMediator.appState))
         await processInlineReply(roomID: roomID, replyText: replyText)
     }
     
@@ -703,6 +784,8 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
         }
         
         if let storedInlineReply {
+            hasPendingStoredInlineReply = false
+            await resumeClientServices(mode: AppCoordinatorClientServiceModeResolver.resumeMode(for: .inlineReply, appState: appMediator.appState))
             await processInlineReply(roomID: storedInlineReply.roomID, replyText: storedInlineReply.message)
         }
     }
@@ -819,7 +902,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
         
         showLoadingIndicator()
         
-        Task { await pauseClientServices(isBackgroundTask: false) }
+        Task { await pauseClientServices(mode: AppCoordinatorClientServiceModeResolver.backgroundPauseMode(), isBackgroundTask: false) }
         userSessionFlowCoordinator?.stop()
         
         guard !isSoft else {
@@ -949,7 +1032,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
         
         navigationRootCoordinator.setRootCoordinator(PlaceholderScreenCoordinator(hideBrandChrome: appSettings.hideBrandChrome))
         
-        Task { await pauseClientServices(isBackgroundTask: false) }
+        Task { await pauseClientServices(mode: AppCoordinatorClientServiceModeResolver.backgroundPauseMode(), isBackgroundTask: false) }
         userSessionFlowCoordinator?.stop()
         
         // Allow for everything to deallocate properly
@@ -1081,49 +1164,6 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
     
     // MARK: - Application State
     
-    private func pauseClientServices(isBackgroundTask: Bool) async {
-        if isBackgroundTask, UIApplication.shared.applicationState == .active {
-            // Attempt to pause the background task services cleanly, only if the app not already running
-            return
-        }
-        
-        await userSession?.clientProxy.pauseServices()
-        clientProxyObserver = nil
-    }
-    
-    private func resumeClientServices() async {
-        guard let userSession else { return }
-        
-        analyticsService.signpost.startTransaction(.upToDateRoomList)
-        
-        await userSession.clientProxy.resumeServices()
-        
-        guard clientProxyObserver == nil else {
-            return
-        }
-        
-        clientProxyObserver = userSession.clientProxy
-            .loadingStatePublisher
-            .dropFirst()
-            .removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in
-                let toastIdentifier = "StaleDataIndicator"
-                guard let self else { return }
-                
-                switch state {
-                case .loading:
-                    if self.userSession?.clientProxy.homeserverReachabilityPublisher.value == .reachable,
-                       self.appMediator.networkMonitor.reachabilityPublisher.value == .reachable {
-                        self.userIndicatorController.submitIndicator(.init(id: toastIdentifier, type: .toast(progress: .indeterminate), title: L10n.commonSyncing, persistent: true))
-                    }
-                case .notLoading:
-                    self.analyticsService.signpost.finishTransaction(.upToDateRoomList)
-                    self.userIndicatorController.retractIndicatorWithId(toastIdentifier)
-                }
-            }
-    }
-    
     private func observeApplicationState() {
         NotificationCenter.default.addObserver(self,
                                                selector: #selector(applicationWillResignActive),
@@ -1162,20 +1202,30 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
     @objc
     private func applicationWillTerminate() {
         MXLog.info("Application will terminate")
-        Task { await pauseClientServices(isBackgroundTask: false) }
+        appSettings.mainAppActivityState = .terminated
+        Task { await pauseClientServices(mode: AppCoordinatorClientServiceModeResolver.backgroundPauseMode(), isBackgroundTask: false) }
     }
     
     @objc
     private func applicationDidEnterBackground() {
         MXLog.info("Application did enter background")
+        appSettings.mainAppActivityState = .background
         
         scheduleDelayedPauseServices()
         scheduleBackgroundAppRefresh()
+        
+        Task {
+            await updateClientServiceMode(AppCoordinatorClientServiceModeResolver.backgroundEnteredModeUpdate())
+        }
     }
     
     @objc
     private func applicationWillResignActive() {
         MXLog.info("Application will resign active")
+        appSettings.mainAppActivityState = .inactive
+        Task {
+            await updateClientServiceMode(AppCoordinatorClientServiceModeResolver.inactiveModeUpdate())
+        }
     }
     
     private func scheduleDelayedPauseServices() {
@@ -1190,7 +1240,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
             // `backgroundTask` will be eventually released in `endActiveBackgroundTask`
             // https://sentry.tools.element.io/organizations/element/issues/4477794/events/9cfd04e4d045440f87498809cf718de5/
             Task { @MainActor in
-                await self.pauseClientServices(isBackgroundTask: true)
+                await self.pauseClientServices(mode: AppCoordinatorClientServiceModeResolver.backgroundPauseMode(), isBackgroundTask: true)
                 self.endActiveBackgroundTask()
             }
         }
@@ -1200,14 +1250,15 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
     private func applicationWillEnterForeground() {
         MXLog.info("Application will enter foreground")
         endActiveBackgroundTask()
-        Task {
-            await resumeClientServices()
-        }
     }
     
     @objc
     private func applicationDidBecomeActive() {
         MXLog.info("Application did become active")
+        appSettings.mainAppActivityState = .foregroundActive
+        Task {
+            await resumeClientServices(mode: AppCoordinatorClientServiceModeResolver.activeForegroundResumeMode())
+        }
     }
     
     private func endActiveBackgroundTask() {
@@ -1270,7 +1321,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
             MXLog.info("Background app refresh task is about to expire.")
             
             Task { @MainActor in
-                await self?.pauseClientServices(isBackgroundTask: true)
+                await self?.pauseClientServices(mode: AppCoordinatorClientServiceModeResolver.backgroundPauseMode(), isBackgroundTask: true)
                 MXLog.info("Marking Background app refresh task as complete.")
                 task.setTaskCompleted(success: true)
             }
@@ -1280,7 +1331,7 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
             return
         }
         
-        await resumeClientServices()
+        await resumeClientServices(mode: AppCoordinatorClientServiceModeResolver.backgroundRefreshResumeMode())
         
         // Be a good citizen, run for a max of 10 SS responses or 10 seconds
         // An SS request will time out after 30 seconds if no new data is available
@@ -1296,10 +1347,65 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
                 // Make sure we stop the sync loop, otherwise the ongoing request is immediately
                 // handled the next time the app refreshes, which can trigger timeout failures.
                 Task {
-                    await self.pauseClientServices(isBackgroundTask: true)
+                    await self.pauseClientServices(mode: AppCoordinatorClientServiceModeResolver.backgroundPauseMode(), isBackgroundTask: true)
                     MXLog.info("Marking Background app refresh task as complete.")
                     task.setTaskCompleted(success: true)
                 }
             }
+    }
+}
+
+private extension AppCoordinator {
+    func pauseClientServices(mode: ClientServiceRunMode, isBackgroundTask: Bool) async {
+        if isBackgroundTask, UIApplication.shared.applicationState == .active {
+            // Attempt to pause the background task services cleanly, only if the app not already running
+            return
+        }
+        
+        await userSession?.clientProxy.pauseServices(mode: mode)
+        clientProxyObserver = nil
+    }
+    
+    func resumeClientServices(mode: ClientServiceRunMode) async {
+        guard let userSession else { return }
+        
+        if mode == .foregroundActive {
+            analyticsService.signpost.startTransaction(.upToDateRoomList)
+        }
+        
+        await userSession.clientProxy.resumeServices(mode: mode)
+        
+        guard mode == .foregroundActive else {
+            return
+        }
+        
+        guard clientProxyObserver == nil else {
+            return
+        }
+        
+        clientProxyObserver = userSession.clientProxy
+            .loadingStatePublisher
+            .dropFirst()
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                let toastIdentifier = "StaleDataIndicator"
+                guard let self else { return }
+                
+                switch state {
+                case .loading:
+                    if self.userSession?.clientProxy.homeserverReachabilityPublisher.value == .reachable,
+                       self.appMediator.networkMonitor.reachabilityPublisher.value == .reachable {
+                        self.userIndicatorController.submitIndicator(.init(id: toastIdentifier, type: .toast(progress: .indeterminate), title: L10n.commonSyncing, persistent: true))
+                    }
+                case .notLoading:
+                    self.analyticsService.signpost.finishTransaction(.upToDateRoomList)
+                    self.userIndicatorController.retractIndicatorWithId(toastIdentifier)
+                }
+            }
+    }
+    
+    func updateClientServiceMode(_ mode: ClientServiceRunMode) async {
+        await userSession?.clientProxy.updateServiceMode(mode)
     }
 }

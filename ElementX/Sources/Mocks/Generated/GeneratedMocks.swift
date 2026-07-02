@@ -2495,37 +2495,96 @@ nonisolated class ClientProxyMock: ClientProxyProtocol, @unchecked Sendable {
     }
     //MARK: - resumeServices
 
-    private let resumeServicesCallsCountLock = NSLock()
-    private nonisolated(unsafe) var resumeServicesUnderlyingCallsCount = 0
-    var resumeServicesCallsCount: Int {
-        get { resumeServicesCallsCountLock.withLock { resumeServicesUnderlyingCallsCount } }
-        set { resumeServicesCallsCountLock.withLock { resumeServicesUnderlyingCallsCount = newValue } }
+    private let resumeServicesModeCallsCountLock = NSLock()
+    private nonisolated(unsafe) var resumeServicesModeUnderlyingCallsCount = 0
+    var resumeServicesModeCallsCount: Int {
+        get { resumeServicesModeCallsCountLock.withLock { resumeServicesModeUnderlyingCallsCount } }
+        set { resumeServicesModeCallsCountLock.withLock { resumeServicesModeUnderlyingCallsCount = newValue } }
     }
-    var resumeServicesCalled: Bool {
-        return resumeServicesCallsCount > 0
+    var resumeServicesModeCalled: Bool {
+        return resumeServicesModeCallsCount > 0
     }
-    nonisolated(unsafe) var resumeServicesClosure: (() async -> Void)?
+    private let resumeServicesModeReceivedModeLock = NSLock()
+    private nonisolated(unsafe) var resumeServicesModeUnderlyingReceivedMode: ClientServiceRunMode?
+    var resumeServicesModeReceivedMode: ClientServiceRunMode? {
+        get { resumeServicesModeReceivedModeLock.withLock { resumeServicesModeUnderlyingReceivedMode } }
+        set { resumeServicesModeReceivedModeLock.withLock { resumeServicesModeUnderlyingReceivedMode = newValue } }
+    }
+    private let resumeServicesModeReceivedInvocationsLock = NSLock()
+    private nonisolated(unsafe) var resumeServicesModeUnderlyingReceivedInvocations: [ClientServiceRunMode] = []
+    var resumeServicesModeReceivedInvocations: [ClientServiceRunMode] {
+        get { resumeServicesModeReceivedInvocationsLock.withLock { resumeServicesModeUnderlyingReceivedInvocations } }
+        set { resumeServicesModeReceivedInvocationsLock.withLock { resumeServicesModeUnderlyingReceivedInvocations = newValue } }
+    }
+    nonisolated(unsafe) var resumeServicesModeClosure: ((ClientServiceRunMode) async -> Void)?
 
-    @concurrent func resumeServices() async {
-        resumeServicesCallsCountLock.withLock { resumeServicesUnderlyingCallsCount += 1 }
-        await resumeServicesClosure?()
+    @concurrent func resumeServices(mode: ClientServiceRunMode) async {
+        resumeServicesModeCallsCountLock.withLock { resumeServicesModeUnderlyingCallsCount += 1 }
+        resumeServicesModeReceivedMode = mode
+        resumeServicesModeReceivedInvocationsLock.withLock { resumeServicesModeUnderlyingReceivedInvocations.append(mode) }
+        await resumeServicesModeClosure?(mode)
     }
     //MARK: - pauseServices
 
-    private let pauseServicesCallsCountLock = NSLock()
-    private nonisolated(unsafe) var pauseServicesUnderlyingCallsCount = 0
-    var pauseServicesCallsCount: Int {
-        get { pauseServicesCallsCountLock.withLock { pauseServicesUnderlyingCallsCount } }
-        set { pauseServicesCallsCountLock.withLock { pauseServicesUnderlyingCallsCount = newValue } }
+    private let pauseServicesModeCallsCountLock = NSLock()
+    private nonisolated(unsafe) var pauseServicesModeUnderlyingCallsCount = 0
+    var pauseServicesModeCallsCount: Int {
+        get { pauseServicesModeCallsCountLock.withLock { pauseServicesModeUnderlyingCallsCount } }
+        set { pauseServicesModeCallsCountLock.withLock { pauseServicesModeUnderlyingCallsCount = newValue } }
     }
-    var pauseServicesCalled: Bool {
-        return pauseServicesCallsCount > 0
+    var pauseServicesModeCalled: Bool {
+        return pauseServicesModeCallsCount > 0
     }
-    nonisolated(unsafe) var pauseServicesClosure: (() async -> Void)?
+    private let pauseServicesModeReceivedModeLock = NSLock()
+    private nonisolated(unsafe) var pauseServicesModeUnderlyingReceivedMode: ClientServiceRunMode?
+    var pauseServicesModeReceivedMode: ClientServiceRunMode? {
+        get { pauseServicesModeReceivedModeLock.withLock { pauseServicesModeUnderlyingReceivedMode } }
+        set { pauseServicesModeReceivedModeLock.withLock { pauseServicesModeUnderlyingReceivedMode = newValue } }
+    }
+    private let pauseServicesModeReceivedInvocationsLock = NSLock()
+    private nonisolated(unsafe) var pauseServicesModeUnderlyingReceivedInvocations: [ClientServiceRunMode] = []
+    var pauseServicesModeReceivedInvocations: [ClientServiceRunMode] {
+        get { pauseServicesModeReceivedInvocationsLock.withLock { pauseServicesModeUnderlyingReceivedInvocations } }
+        set { pauseServicesModeReceivedInvocationsLock.withLock { pauseServicesModeUnderlyingReceivedInvocations = newValue } }
+    }
+    nonisolated(unsafe) var pauseServicesModeClosure: ((ClientServiceRunMode) async -> Void)?
 
-    @concurrent func pauseServices() async {
-        pauseServicesCallsCountLock.withLock { pauseServicesUnderlyingCallsCount += 1 }
-        await pauseServicesClosure?()
+    @concurrent func pauseServices(mode: ClientServiceRunMode) async {
+        pauseServicesModeCallsCountLock.withLock { pauseServicesModeUnderlyingCallsCount += 1 }
+        pauseServicesModeReceivedMode = mode
+        pauseServicesModeReceivedInvocationsLock.withLock { pauseServicesModeUnderlyingReceivedInvocations.append(mode) }
+        await pauseServicesModeClosure?(mode)
+    }
+    //MARK: - updateServiceMode
+
+    private let updateServiceModeCallsCountLock = NSLock()
+    private nonisolated(unsafe) var updateServiceModeUnderlyingCallsCount = 0
+    var updateServiceModeCallsCount: Int {
+        get { updateServiceModeCallsCountLock.withLock { updateServiceModeUnderlyingCallsCount } }
+        set { updateServiceModeCallsCountLock.withLock { updateServiceModeUnderlyingCallsCount = newValue } }
+    }
+    var updateServiceModeCalled: Bool {
+        return updateServiceModeCallsCount > 0
+    }
+    private let updateServiceModeReceivedModeLock = NSLock()
+    private nonisolated(unsafe) var updateServiceModeUnderlyingReceivedMode: ClientServiceRunMode?
+    var updateServiceModeReceivedMode: ClientServiceRunMode? {
+        get { updateServiceModeReceivedModeLock.withLock { updateServiceModeUnderlyingReceivedMode } }
+        set { updateServiceModeReceivedModeLock.withLock { updateServiceModeUnderlyingReceivedMode = newValue } }
+    }
+    private let updateServiceModeReceivedInvocationsLock = NSLock()
+    private nonisolated(unsafe) var updateServiceModeUnderlyingReceivedInvocations: [ClientServiceRunMode] = []
+    var updateServiceModeReceivedInvocations: [ClientServiceRunMode] {
+        get { updateServiceModeReceivedInvocationsLock.withLock { updateServiceModeUnderlyingReceivedInvocations } }
+        set { updateServiceModeReceivedInvocationsLock.withLock { updateServiceModeUnderlyingReceivedInvocations = newValue } }
+    }
+    nonisolated(unsafe) var updateServiceModeClosure: ((ClientServiceRunMode) async -> Void)?
+
+    @concurrent func updateServiceMode(_ mode: ClientServiceRunMode) async {
+        updateServiceModeCallsCountLock.withLock { updateServiceModeUnderlyingCallsCount += 1 }
+        updateServiceModeReceivedMode = mode
+        updateServiceModeReceivedInvocationsLock.withLock { updateServiceModeUnderlyingReceivedInvocations.append(mode) }
+        await updateServiceModeClosure?(mode)
     }
     //MARK: - expireSyncSessions
 
