@@ -2493,6 +2493,34 @@ nonisolated class ClientProxyMock: ClientProxyProtocol, @unchecked Sendable {
             return hasDevicesToVerifyAgainstReturnValue
         }
     }
+    //MARK: - acquireBackgroundSyncLease
+
+    private let acquireBackgroundSyncLeaseCallsCountLock = NSLock()
+    private nonisolated(unsafe) var acquireBackgroundSyncLeaseUnderlyingCallsCount = 0
+    var acquireBackgroundSyncLeaseCallsCount: Int {
+        get { acquireBackgroundSyncLeaseCallsCountLock.withLock { acquireBackgroundSyncLeaseUnderlyingCallsCount } }
+        set { acquireBackgroundSyncLeaseCallsCountLock.withLock { acquireBackgroundSyncLeaseUnderlyingCallsCount = newValue } }
+    }
+    var acquireBackgroundSyncLeaseCalled: Bool {
+        return acquireBackgroundSyncLeaseCallsCount > 0
+    }
+
+    private let acquireBackgroundSyncLeaseReturnValueLock = NSLock()
+    private nonisolated(unsafe) var acquireBackgroundSyncLeaseUnderlyingReturnValue: ClientProxyBackgroundSyncLeaseProtocol!
+    var acquireBackgroundSyncLeaseReturnValue: ClientProxyBackgroundSyncLeaseProtocol! {
+        get { acquireBackgroundSyncLeaseReturnValueLock.withLock { acquireBackgroundSyncLeaseUnderlyingReturnValue } }
+        set { acquireBackgroundSyncLeaseReturnValueLock.withLock { acquireBackgroundSyncLeaseUnderlyingReturnValue = newValue } }
+    }
+    nonisolated(unsafe) var acquireBackgroundSyncLeaseClosure: (() async -> ClientProxyBackgroundSyncLeaseProtocol)?
+
+    @concurrent func acquireBackgroundSyncLease() async -> ClientProxyBackgroundSyncLeaseProtocol {
+        acquireBackgroundSyncLeaseCallsCountLock.withLock { acquireBackgroundSyncLeaseUnderlyingCallsCount += 1 }
+        if let acquireBackgroundSyncLeaseClosure = acquireBackgroundSyncLeaseClosure {
+            return await acquireBackgroundSyncLeaseClosure()
+        } else {
+            return acquireBackgroundSyncLeaseReturnValue
+        }
+    }
     //MARK: - resumeServices
 
     private let resumeServicesModeCallsCountLock = NSLock()

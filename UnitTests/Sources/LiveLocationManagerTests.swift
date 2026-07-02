@@ -201,44 +201,37 @@ final class LiveLocationManagerTests {
     // MARK: - Location updates
     
     @Test
-    func locationUpdateInBackgroundResumesServicesUsingBackgroundSyncBeforeSending() async throws {
+    func locationUpdateInBackgroundAcquiresBackgroundSyncLeaseBeforeSending() async throws {
         setUp(appState: .background)
         let roomID = "!room:matrix.org"
         let roomProxy = makeRoomProxy(roomID: roomID)
         clientProxy.roomForIdentifierClosure = { _ in .joined(roomProxy) }
         appSettings.liveLocationSharingSessionsByRoomID[roomID] = LiveLocationSession(eventID: "$event:matrix.org", expirationDate: Date().addingTimeInterval(300))
         
-        let sendSubject = PassthroughSubject<Void, Never>()
-        let pauseSubject = PassthroughSubject<ClientServiceRunMode, Never>()
-        let sendDeferred = deferFulfillment(sendSubject) { true }
-        let pauseDeferred = deferFulfillment(pauseSubject) { $0 == .backgroundGrace }
-        var callOrder = [LocationSendStep]()
+        let backgroundSyncLeaseRecorder = BackgroundSyncLeaseRecorder(recordsPauseWhenIdle: true)
+        let events = await backgroundSyncLeaseRecorder.eventStream()
+        let releaseDeferred = deferFulfillment(events) { $0 == .release(1) }
         
-        clientProxy.resumeServicesModeClosure = { mode in
-            callOrder.append(.resume(mode))
+        clientProxy.acquireBackgroundSyncLeaseClosure = {
+            await backgroundSyncLeaseRecorder.acquire()
         }
         roomProxy.sendLiveLocationGeoURIClosure = { _ in
-            callOrder.append(.send)
-            sendSubject.send()
+            await backgroundSyncLeaseRecorder.record(.send)
             return .success(())
-        }
-        clientProxy.pauseServicesModeClosure = { mode in
-            callOrder.append(.pause(mode))
-            pauseSubject.send(mode)
         }
         
         manager.locationManager(CLLocationManager(), didUpdateLocations: [CLLocation(latitude: 1.2, longitude: 3.4)])
         
-        try await sendDeferred.fulfill()
-        try await pauseDeferred.fulfill()
+        try await releaseDeferred.fulfill()
         
-        #expect(clientProxy.resumeServicesModeReceivedInvocations == [.backgroundSync])
-        #expect(clientProxy.pauseServicesModeReceivedInvocations == [.backgroundGrace])
-        #expect(callOrder == [.resume(.backgroundSync), .send, .pause(.backgroundGrace)])
+        #expect(clientProxy.acquireBackgroundSyncLeaseCallsCount == 1)
+        #expect(clientProxy.resumeServicesModeReceivedInvocations.isEmpty)
+        #expect(clientProxy.pauseServicesModeReceivedInvocations.isEmpty)
+        #expect(await backgroundSyncLeaseRecorder.recordedEvents == [.acquire(1), .send, .release(1), .pause])
     }
     
     @Test
-    func locationUpdateInForegroundDoesNotResumeServices() async throws {
+    func locationUpdateInForegroundDoesNotAcquireBackgroundSyncLease() async throws {
         setUp(appState: .active)
         let roomID = "!room:matrix.org"
         let roomProxy = makeRoomProxy(roomID: roomID)
@@ -256,6 +249,50 @@ final class LiveLocationManagerTests {
         
         try await sendDeferred.fulfill()
         
+        #expect(clientProxy.acquireBackgroundSyncLeaseCallsCount == 0)
+        #expect(clientProxy.resumeServicesModeReceivedInvocations.isEmpty)
+        #expect(clientProxy.pauseServicesModeReceivedInvocations.isEmpty)
+    }
+    
+    @Test
+    func overlappingBackgroundOperationsReleaseOnlyTheirOwnLease() async throws {
+        setUp(appState: .background)
+        let roomID = "!room:matrix.org"
+        let roomProxy = makeRoomProxy(roomID: roomID)
+        clientProxy.roomForIdentifierClosure = { _ in .joined(roomProxy) }
+        appSettings.liveLocationSharingSessionsByRoomID[roomID] = LiveLocationSession(eventID: "$event:matrix.org", expirationDate: Date().addingTimeInterval(300))
+        
+        let backgroundSyncLeaseRecorder = BackgroundSyncLeaseRecorder(recordsPauseWhenIdle: true)
+        let sendEvents = await backgroundSyncLeaseRecorder.eventStream()
+        let pauseEvents = await backgroundSyncLeaseRecorder.eventStream()
+        let firstSendStarted = deferFulfillment(sendEvents) { $0 == .send }
+        let pauseDeferred = deferFulfillment(pauseEvents) { $0 == .pause }
+        let sendGate = AsyncGate()
+        
+        clientProxy.acquireBackgroundSyncLeaseClosure = {
+            await backgroundSyncLeaseRecorder.acquire()
+        }
+        roomProxy.sendLiveLocationGeoURIClosure = { _ in
+            await backgroundSyncLeaseRecorder.record(.send)
+            await sendGate.wait()
+            return .success(())
+        }
+        roomProxy.stopLiveLocationShareClosure = {
+            await backgroundSyncLeaseRecorder.record(.stop)
+            return .success(())
+        }
+        
+        manager.locationManager(CLLocationManager(), didUpdateLocations: [CLLocation(latitude: 1.2, longitude: 3.4)])
+        try await firstSendStarted.fulfill()
+        
+        await manager.stopLiveLocation(roomID: roomID)
+        
+        #expect(await backgroundSyncLeaseRecorder.recordedEvents == [.acquire(1), .send, .acquire(2), .stop, .release(2)])
+        
+        await sendGate.open()
+        try await pauseDeferred.fulfill()
+        
+        #expect(await backgroundSyncLeaseRecorder.recordedEvents == [.acquire(1), .send, .acquire(2), .stop, .release(2), .release(1), .pause])
         #expect(clientProxy.resumeServicesModeReceivedInvocations.isEmpty)
         #expect(clientProxy.pauseServicesModeReceivedInvocations.isEmpty)
     }
@@ -309,9 +346,24 @@ final class LiveLocationManagerTests {
         try await deferred.fulfill()
     }
     
-    private enum LocationSendStep: Equatable {
-        case resume(ClientServiceRunMode)
-        case send
-        case pause(ClientServiceRunMode)
+    private actor AsyncGate {
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var isOpen = false
+        
+        func wait() async {
+            guard !isOpen else {
+                return
+            }
+            
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+            }
+        }
+        
+        func open() {
+            isOpen = true
+            continuation?.resume()
+            continuation = nil
+        }
     }
 }

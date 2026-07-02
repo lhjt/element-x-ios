@@ -48,12 +48,6 @@ enum SlidingSyncConstants {
     static let maximumVisibleRangeSize = 30
 }
 
-enum ClientServiceRunMode: Equatable {
-    case foregroundActive
-    case backgroundGrace
-    case backgroundSync
-}
-
 enum CreateRoomAccessType: Equatable {
     case `public`
     case spaceMembers(spaceID: String)
@@ -174,6 +168,8 @@ protocol ClientProxyProtocol: AnyObject {
     func isOnlyDeviceLeft() async -> Result<Bool, ClientProxyError>
     
     func hasDevicesToVerifyAgainst() async -> Result<Bool, ClientProxyError>
+    
+    func acquireBackgroundSyncLease() async -> ClientProxyBackgroundSyncLeaseProtocol
     
     func resumeServices(mode: ClientServiceRunMode) async
     

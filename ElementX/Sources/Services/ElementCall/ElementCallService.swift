@@ -32,20 +32,22 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
     private let callController = CXCallController()
     private let callProvider: CXProviderProtocol
     private let timeProvider: TimeProvider
+    private let applicationState: () -> UIApplication.State
     
     private weak var clientProxy: ClientProxyProtocol? {
         didSet {
             // There's a race condition where a call starts when the app has been killed and the
             // observation set in `incomingCallID` occurs *before* the user session is restored.
             // So observe when the client proxy is set to fix this (the method guards for the call).
-            Task { await observeIncomingCall() }
+            Task { [incomingCallID] in await observeIncomingCall(incomingCallID) }
         }
     }
     
     private var incomingCallRoomInfoCancellable: AnyCancellable?
+    private var incomingCallBackgroundSyncLease: (callID: CallID, lease: ClientProxyBackgroundSyncLeaseProtocol)?
     private var incomingCallID: CallID? {
         didSet {
-            Task { await observeIncomingCall() }
+            Task { [incomingCallID] in await observeIncomingCall(incomingCallID) }
         }
     }
     
@@ -67,10 +69,13 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
     
     private var declineListenerHandle: TaskHandle?
     
-    init(callProvider: CXProviderProtocol? = nil, timeProvider: TimeProvider? = nil) {
+    init(callProvider: CXProviderProtocol? = nil,
+         timeProvider: TimeProvider? = nil,
+         applicationState: @escaping () -> UIApplication.State = { UIApplication.shared.applicationState }) {
         pushRegistry = PKPushRegistry(queue: nil)
         
         self.timeProvider = timeProvider ?? TimeProvider(clock: ContinuousClock(), now: Date.init)
+        self.applicationState = applicationState
         
         if let callProvider {
             self.callProvider = callProvider
@@ -115,7 +120,7 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
             CallID(callKitID: UUID(), roomID: roomID, rtcNotificationID: nil, isVoiceCall: false)
         }
         
-        clearIncomingCallState()
+        await clearIncomingCallStateAndWaitForBackgroundSyncLeaseRelease()
         ongoingCallID = callID
         
         // Don't bother starting another CallKit session as it won't work properly
@@ -392,38 +397,65 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
             return
         }
         
-        let didResumeBackgroundServices = await resumeServicesForBackgroundWorkIfNeeded()
+        let backgroundSyncLease = await backgroundSyncLeaseForBackgroundWorkIfNeeded()
         
         guard case let .joined(roomProxy) = await clientProxy.roomForIdentifier(incomingCallID.roomID) else {
             MXLog.warning("Failed to fetch a joined room for the incoming call.")
-            await pauseServicesAfterBackgroundWorkIfNeeded(didResumeBackgroundServices)
+            await backgroundSyncLease?.release()
             return
         }
         
         _ = await roomProxy.declineCall(notificationID: rtcNotificationID)
-        await pauseServicesAfterBackgroundWorkIfNeeded(didResumeBackgroundServices)
+        await backgroundSyncLease?.release()
     }
     
-    private func observeIncomingCall() async {
-        incomingCallRoomInfoCancellable = nil
-        
+    private func observeIncomingCall(_ incomingCallID: CallID?) async {
         guard let incomingCallID else {
             MXLog.info("No incoming call to observe for.")
             return
         }
+        
+        guard isCurrentIncomingCall(incomingCallID) else {
+            MXLog.info("Ignoring stale incoming call observation for room \(incomingCallID.roomID).")
+            return
+        }
+        
+        incomingCallRoomInfoCancellable = nil
         
         guard let clientProxy else {
             MXLog.warning("A ClientProxy is needed to fetch the room.")
             return
         }
         
-        await resumeServicesForBackgroundWorkIfNeeded()
-        
-        guard case let .joined(roomProxy) = await clientProxy.roomForIdentifier(incomingCallID.roomID) else {
-            MXLog.warning("Failed to fetch a joined room for the incoming call.")
+        guard let roomProxy = await joinedRoomProxyForCurrentIncomingCall(incomingCallID, clientProxy: clientProxy) else {
             return
         }
         
+        observeRoomInfo(for: incomingCallID, roomProxy: roomProxy)
+        await observeDeclineEvents(for: incomingCallID, roomProxy: roomProxy)
+    }
+    
+    private func joinedRoomProxyForCurrentIncomingCall(_ incomingCallID: CallID, clientProxy: ClientProxyProtocol) async -> JoinedRoomProxyProtocol? {
+        guard await acquireIncomingCallBackgroundSyncLeaseIfNeeded(for: incomingCallID) else {
+            return nil
+        }
+        
+        guard case let .joined(roomProxy) = await clientProxy.roomForIdentifier(incomingCallID.roomID) else {
+            MXLog.warning("Failed to fetch a joined room for the incoming call.")
+            await releaseIncomingCallBackgroundSyncLease(matching: incomingCallID)
+            return nil
+        }
+        
+        guard isCurrentIncomingCall(incomingCallID) else {
+            MXLog.info("Ignoring stale incoming call observation for room \(incomingCallID.roomID).")
+            await releaseIncomingCallBackgroundSyncLease(matching: incomingCallID)
+            return nil
+        }
+        
+        return roomProxy
+    }
+    
+    private func observeRoomInfo(for incomingCallID: CallID, roomProxy: JoinedRoomProxyProtocol) {
         roomProxy.subscribeToRoomInfoUpdates()
         
         incomingCallRoomInfoCancellable = roomProxy
@@ -448,9 +480,12 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
                     reportEndedCall(incomingCallID: incomingCallID, reason: .answeredElsewhere)
                 }
             }
-        
+    }
+    
+    private func observeDeclineEvents(for incomingCallID: CallID, roomProxy: JoinedRoomProxyProtocol) async {
         guard let rtcNotificationID = incomingCallID.rtcNotificationID else {
             MXLog.warning("Decline: No RTC notification ID found for the incoming call.")
+            await releaseIncomingCallBackgroundSyncLease(matching: incomingCallID)
             return
         }
         
@@ -470,6 +505,7 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
         
         guard case let .success(handle) = roomProxy.subscribeToCallDeclineEvents(rtcNotificationEventID: rtcNotificationID, listener: listener) else {
             MXLog.error("Unable to listen for decline events.")
+            await releaseIncomingCallBackgroundSyncLease(matching: incomingCallID)
             return
         }
         
@@ -482,22 +518,81 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
     }
     
     @discardableResult
-    private func resumeServicesForBackgroundWorkIfNeeded() async -> Bool {
-        guard UIApplication.shared.applicationState != .active,
+    private func backgroundSyncLeaseForBackgroundWorkIfNeeded() async -> ClientProxyBackgroundSyncLeaseProtocol? {
+        guard applicationState() != .active,
               let clientProxy else {
+            return nil
+        }
+        
+        return await clientProxy.acquireBackgroundSyncLease()
+    }
+    
+    private func acquireIncomingCallBackgroundSyncLeaseIfNeeded(for incomingCallID: CallID) async -> Bool {
+        guard isCurrentIncomingCall(incomingCallID) else {
             return false
         }
         
-        await clientProxy.resumeServices(mode: .backgroundSync)
+        if let existingLease = incomingCallBackgroundSyncLease {
+            guard existingLease.callID != incomingCallID else {
+                return true
+            }
+            
+            incomingCallBackgroundSyncLease = nil
+            await existingLease.lease.release()
+            
+            guard isCurrentIncomingCall(incomingCallID) else {
+                return false
+            }
+        }
+        
+        let backgroundSyncLease = await backgroundSyncLeaseForBackgroundWorkIfNeeded()
+        
+        guard isCurrentIncomingCall(incomingCallID) else {
+            await backgroundSyncLease?.release()
+            return false
+        }
+        
+        if let backgroundSyncLease {
+            incomingCallBackgroundSyncLease = (callID: incomingCallID, lease: backgroundSyncLease)
+        }
+        
         return true
     }
     
-    private func pauseServicesAfterBackgroundWorkIfNeeded(_ didResumeBackgroundServices: Bool) async {
-        guard didResumeBackgroundServices, UIApplication.shared.applicationState != .active else {
+    private func releaseIncomingCallBackgroundSyncLease() async {
+        let backgroundSyncLease = incomingCallBackgroundSyncLease
+        incomingCallBackgroundSyncLease = nil
+        await backgroundSyncLease?.lease.release()
+    }
+    
+    private func releaseIncomingCallBackgroundSyncLease(matching incomingCallID: CallID) async {
+        guard incomingCallBackgroundSyncLease?.callID == incomingCallID else {
             return
         }
         
-        await clientProxy?.pauseServices(mode: .backgroundGrace)
+        await releaseIncomingCallBackgroundSyncLease()
+    }
+    
+    private func releaseIncomingCallBackgroundSyncLeaseInTask() {
+        let backgroundSyncLease = incomingCallBackgroundSyncLease
+        incomingCallBackgroundSyncLease = nil
+        Task {
+            await backgroundSyncLease?.lease.release()
+        }
+    }
+    
+    private func isCurrentIncomingCall(_ incomingCallID: CallID) -> Bool {
+        self.incomingCallID == incomingCallID
+    }
+    
+    private func clearIncomingCallStateAndWaitForBackgroundSyncLeaseRelease() async {
+        endUnansweredCallTask?.cancel()
+        endUnansweredCallTask = nil
+        declineListenerHandle?.cancel()
+        declineListenerHandle = nil
+        await releaseIncomingCallBackgroundSyncLease()
+        incomingCallRoomInfoCancellable = nil
+        incomingCallID = nil
     }
     
     /// Cancels every subscription and task tied to a ringing incoming call and nils `incomingCallID`.
@@ -509,6 +604,7 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
         endUnansweredCallTask = nil
         declineListenerHandle?.cancel()
         declineListenerHandle = nil
+        releaseIncomingCallBackgroundSyncLeaseInTask()
         incomingCallRoomInfoCancellable = nil
         incomingCallID = nil
     }

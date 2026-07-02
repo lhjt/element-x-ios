@@ -10,6 +10,7 @@ import Combine
 @testable import ElementX
 import NotificationCenter
 import Testing
+import UIKit
 
 @MainActor
 final class NotificationManagerTests {
@@ -63,6 +64,35 @@ final class NotificationManagerTests {
         clientProxy.setPusherWithThrowableError = TestError.someError
         let success = await notificationManager.register(with: Data())
         #expect(!success)
+    }
+    
+    @Test
+    func whenRegisteredInBackground_backgroundSyncLeaseIsReleased() async {
+        let backgroundSyncLeaseRecorder = BackgroundSyncLeaseRecorder()
+        clientProxy.acquireBackgroundSyncLeaseClosure = {
+            await backgroundSyncLeaseRecorder.acquire()
+        }
+        makeNotificationManager(appState: .background)
+        
+        let success = await notificationManager.register(with: Data())
+        
+        #expect(success)
+        #expect(clientProxy.acquireBackgroundSyncLeaseCallsCount == 1)
+        #expect(clientProxy.resumeServicesModeReceivedInvocations.isEmpty)
+        #expect(clientProxy.pauseServicesModeReceivedInvocations.isEmpty)
+        #expect(await backgroundSyncLeaseRecorder.recordedEvents == [.acquire(1), .release(1)])
+    }
+    
+    @Test
+    func whenRegisteredInForeground_backgroundSyncLeaseIsNotAcquired() async {
+        makeNotificationManager(appState: .active)
+        
+        let success = await notificationManager.register(with: Data())
+        
+        #expect(success)
+        #expect(clientProxy.acquireBackgroundSyncLeaseCallsCount == 0)
+        #expect(clientProxy.resumeServicesModeReceivedInvocations.isEmpty)
+        #expect(clientProxy.pauseServicesModeReceivedInvocations.isEmpty)
     }
     
     @Test
@@ -236,6 +266,15 @@ final class NotificationManagerTests {
         let response = try UNTextInputNotificationResponse.with(userInfo: [AnyHashable: Any](), actionIdentifier: UNNotificationDefaultActionIdentifier)
         await notificationManager.userNotificationCenter(UNUserNotificationCenter.current(), didReceive: response)
         #expect(notificationTappedDelegateCalled)
+    }
+    
+    private func makeNotificationManager(appState: UIApplication.State) {
+        notificationManager = NotificationManager(notificationCenter: notificationCenter,
+                                                  appSettings: appSettings) {
+            appState
+        }
+        notificationManager.start()
+        notificationManager.setUserSession(mockUserSession)
     }
 }
 

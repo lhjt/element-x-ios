@@ -402,6 +402,36 @@ class ClientProxy: ClientProxyProtocol {
         }
     }
     
+    private var backgroundSyncLeaseIDs = Set<UUID>()
+    
+    func acquireBackgroundSyncLease() async -> ClientProxyBackgroundSyncLeaseProtocol {
+        let id = UUID()
+        let shouldResumeBackgroundSync = backgroundSyncLeaseIDs.isEmpty
+        backgroundSyncLeaseIDs.insert(id)
+        
+        if shouldResumeBackgroundSync {
+            await resumeServices(mode: .backgroundSync)
+        }
+        
+        return ClientProxyBackgroundSyncLease(id: id) { [weak self] id in
+            await self?.releaseBackgroundSyncLease(id)
+        }
+    }
+    
+    fileprivate func releaseBackgroundSyncLease(_ id: UUID) async {
+        guard backgroundSyncLeaseIDs.remove(id) != nil else {
+            return
+        }
+        
+        guard backgroundSyncLeaseIDs.isEmpty,
+              desiredServiceState.isRunningInBackground,
+              currentServiceState.isRunningInBackground else {
+            return
+        }
+        
+        await pauseServices(mode: .backgroundGrace)
+    }
+    
     func resumeServices(mode: ClientServiceRunMode) async {
         MXLog.info("Resuming services")
         
@@ -1046,6 +1076,8 @@ class ClientProxy: ClientProxyProtocol {
                         guard let self else { return }
                         await self.resumeServices(mode: self.desiredServiceState.runMode)
                     }
+                } else {
+                    self?.updateHomeserverReachability()
                 }
             }
             .store(in: &cancellables)
@@ -1116,58 +1148,6 @@ class ClientProxy: ClientProxyProtocol {
     
     // MARK: - Pausing and resuming
     
-    private enum ClientPresence {
-        case online
-        case unavailable
-        case offline
-        
-        var rustValue: PresenceState {
-            switch self {
-            case .online:
-                .online
-            case .unavailable:
-                .unavailable
-            case .offline:
-                .offline
-            }
-        }
-    }
-    
-    private struct PresenceUpdate {
-        let presence: ClientPresence
-        let sendImmediately: Bool
-    }
-    
-    private enum ServiceState: Equatable {
-        case running(ClientServiceRunMode)
-        case suspended(ClientServiceRunMode)
-        
-        var isRunning: Bool {
-            switch self {
-            case .running:
-                true
-            case .suspended:
-                false
-            }
-        }
-        
-        var runMode: ClientServiceRunMode {
-            switch self {
-            case .running(let mode), .suspended(let mode):
-                mode
-            }
-        }
-        
-        func withRunMode(_ mode: ClientServiceRunMode) -> ServiceState {
-            switch self {
-            case .running:
-                .running(mode)
-            case .suspended:
-                .suspended(mode)
-            }
-        }
-    }
-    
     /// The state the sync service and client *should* be in, updated by ``resumeServices(mode:)`` and ``pauseServices(mode:)``.
     private var desiredServiceState: ServiceState = .suspended(.backgroundGrace)
     private var currentServiceState: ServiceState = .suspended(.backgroundGrace)
@@ -1193,15 +1173,22 @@ class ClientProxy: ClientProxyProtocol {
     
     private func reconcileServiceState() async {
         let desiredServiceState = desiredServiceState
+        
+        guard canReconcile(desiredServiceState) else {
+            updateHomeserverReachability()
+            return
+        }
+        
         let forceImmediatePresenceUpdate = forceImmediatePresenceUpdate
         self.forceImmediatePresenceUpdate = false
         
-        let presenceUpdate = presenceUpdate(for: desiredServiceState,
-                                            forceImmediate: forceImmediatePresenceUpdate)
-        await setPresence(presenceUpdate.presence, sendImmediately: presenceUpdate.sendImmediately)
+        let presenceUpdate = desiredServiceState.presenceUpdate(sharePresence: appSettings.sharePresence,
+                                                                forceImmediate: forceImmediatePresenceUpdate)
         
         switch desiredServiceState {
         case .running:
+            await setPresence(presenceUpdate.presence, sendImmediately: presenceUpdate.sendImmediately)
+            
             if currentServiceState.isRunning {
                 currentServiceState = desiredServiceState
                 updateHomeserverReachability()
@@ -1240,6 +1227,7 @@ class ClientProxy: ClientProxyProtocol {
             sendQueueStatusSubject.send(sendQueueStatusSubject.value)
         case .suspended:
             guard currentServiceState.isRunning else {
+                await setPresence(presenceUpdate.presence, sendImmediately: presenceUpdate.sendImmediately)
                 currentServiceState = desiredServiceState
                 updateHomeserverReachability()
                 return
@@ -1261,30 +1249,12 @@ class ClientProxy: ClientProxyProtocol {
             }
             
             currentServiceState = desiredServiceState
+            await setPresence(presenceUpdate.presence, sendImmediately: presenceUpdate.sendImmediately)
         }
     }
     
-    private func presenceUpdate(for serviceState: ServiceState, forceImmediate: Bool) -> PresenceUpdate {
-        let update: PresenceUpdate
-        
-        switch (serviceState, appSettings.sharePresence) {
-        case (.running(.foregroundActive), true):
-            update = .init(presence: .online, sendImmediately: false)
-        case (.running(.foregroundActive), false):
-            update = .init(presence: .offline, sendImmediately: false)
-        case (.running(.backgroundSync), _):
-            update = .init(presence: .offline, sendImmediately: true)
-        case (_, true):
-            update = .init(presence: .unavailable, sendImmediately: true)
-        case (_, false):
-            update = .init(presence: .offline, sendImmediately: true)
-        }
-        
-        guard forceImmediate else {
-            return update
-        }
-        
-        return .init(presence: update.presence, sendImmediately: true)
+    private func canReconcile(_ serviceState: ServiceState) -> Bool {
+        !serviceState.isRunning || networkMonitor.reachabilityPublisher.value == .reachable
     }
     
     private func setPresence(_ presence: ClientPresence, sendImmediately: Bool) async {
@@ -1370,6 +1340,8 @@ class ClientProxy: ClientProxyProtocol {
     private func updateHomeserverReachability() {
         let reachability: HomeserverReachability = if !desiredServiceState.isRunning {
             .suspended
+        } else if networkMonitor.reachabilityPublisher.value != .reachable {
+            .unreachable
         } else if syncServiceState == .offline {
             .unreachable
         } else {

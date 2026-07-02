@@ -14,11 +14,11 @@ struct NotificationExtensionPresencePolicyTests {
     func freshForegroundActiveStateSkipsForcingOfflinePresence() {
         let currentSystemUptime: TimeInterval = 100
         
-        #expect(!NotificationExtensionPresencePolicy(mainAppActivityState: .foregroundActive,
-                                                     mainAppActivityStateLastUpdatedSystemUptime: currentSystemUptime)
+        #expect(!NotificationExtensionPresencePolicy(sharePresence: true,
+                                                     mainAppActivityStateSnapshot: snapshot(lastUpdatedSystemUptime: currentSystemUptime))
                 .shouldForceOfflinePresence(currentSystemUptime: currentSystemUptime))
-        #expect(!NotificationExtensionPresencePolicy(mainAppActivityState: .foregroundActive,
-                                                     mainAppActivityStateLastUpdatedSystemUptime: currentSystemUptime - NotificationExtensionPresencePolicy.foregroundActiveMaximumAge)
+        #expect(!NotificationExtensionPresencePolicy(sharePresence: true,
+                                                     mainAppActivityStateSnapshot: snapshot(lastUpdatedSystemUptime: currentSystemUptime - NotificationExtensionPresencePolicy.foregroundActiveMaximumAge))
                 .shouldForceOfflinePresence(currentSystemUptime: currentSystemUptime))
     }
     
@@ -27,8 +27,8 @@ struct NotificationExtensionPresencePolicyTests {
         let currentSystemUptime: TimeInterval = 100
         let staleSystemUptime = currentSystemUptime - NotificationExtensionPresencePolicy.foregroundActiveMaximumAge - 1
         
-        #expect(NotificationExtensionPresencePolicy(mainAppActivityState: .foregroundActive,
-                                                    mainAppActivityStateLastUpdatedSystemUptime: staleSystemUptime)
+        #expect(NotificationExtensionPresencePolicy(sharePresence: true,
+                                                    mainAppActivityStateSnapshot: snapshot(lastUpdatedSystemUptime: staleSystemUptime))
                 .shouldForceOfflinePresence(currentSystemUptime: currentSystemUptime))
     }
     
@@ -36,11 +36,11 @@ struct NotificationExtensionPresencePolicyTests {
     func missingOrFutureForegroundActiveTimestampForcesOfflinePresence() {
         let currentSystemUptime: TimeInterval = 100
         
-        #expect(NotificationExtensionPresencePolicy(mainAppActivityState: .foregroundActive,
-                                                    mainAppActivityStateLastUpdatedSystemUptime: nil)
+        #expect(NotificationExtensionPresencePolicy(sharePresence: true,
+                                                    mainAppActivityStateSnapshot: snapshot(lastUpdatedSystemUptime: nil))
                 .shouldForceOfflinePresence(currentSystemUptime: currentSystemUptime))
-        #expect(NotificationExtensionPresencePolicy(mainAppActivityState: .foregroundActive,
-                                                    mainAppActivityStateLastUpdatedSystemUptime: currentSystemUptime + 1)
+        #expect(NotificationExtensionPresencePolicy(sharePresence: true,
+                                                    mainAppActivityStateSnapshot: snapshot(lastUpdatedSystemUptime: currentSystemUptime + 1))
                 .shouldForceOfflinePresence(currentSystemUptime: currentSystemUptime))
     }
     
@@ -49,9 +49,37 @@ struct NotificationExtensionPresencePolicyTests {
         let currentSystemUptime: TimeInterval = 100
         
         for mainAppActivityState in [MainAppActivityState.inactive, .background, .terminated] {
-            #expect(NotificationExtensionPresencePolicy(mainAppActivityState: mainAppActivityState,
-                                                        mainAppActivityStateLastUpdatedSystemUptime: currentSystemUptime)
+            #expect(NotificationExtensionPresencePolicy(sharePresence: true,
+                                                        mainAppActivityStateSnapshot: snapshot(state: mainAppActivityState,
+                                                                                               lastUpdatedSystemUptime: currentSystemUptime))
                     .shouldForceOfflinePresence(currentSystemUptime: currentSystemUptime))
         }
+    }
+    
+    @Test
+    func disabledSharePresenceForcesOfflinePresence() {
+        let currentSystemUptime: TimeInterval = 100
+        
+        #expect(NotificationExtensionPresencePolicy(sharePresence: false,
+                                                    mainAppActivityStateSnapshot: snapshot(lastUpdatedSystemUptime: currentSystemUptime))
+                .shouldForceOfflinePresence(currentSystemUptime: currentSystemUptime))
+    }
+    
+    @Test
+    func appSettingsStoresMainAppActivityStateSnapshot() {
+        let store = VolatileUserDefaults()
+        let appSettings = AppSettings(store: store)
+        
+        appSettings.updateMainAppActivityState(.foregroundActive, systemUptime: 100)
+        
+        #expect(appSettings.mainAppActivityStateSnapshot == .init(state: .foregroundActive, lastUpdatedSystemUptime: 100))
+        #expect(store.data(forKey: "mainAppActivityStateSnapshot") != nil)
+        #expect(store.object(forKey: "mainAppActivityState") == nil)
+        #expect(store.object(forKey: "mainAppActivityStateLastUpdatedSystemUptime") == nil)
+    }
+    
+    private func snapshot(state: MainAppActivityState = .foregroundActive,
+                          lastUpdatedSystemUptime: TimeInterval?) -> MainAppActivityStateSnapshot {
+        MainAppActivityStateSnapshot(state: state, lastUpdatedSystemUptime: lastUpdatedSystemUptime)
     }
 }

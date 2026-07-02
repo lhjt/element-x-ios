@@ -119,10 +119,10 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
     }
     
     private func stopLiveLocation(roomID: String, managesBackgroundServices: Bool) async {
-        let didResumeBackgroundServices = if managesBackgroundServices {
-            await resumeServicesForBackgroundSendIfNeeded()
+        let backgroundSyncLease: ClientProxyBackgroundSyncLeaseProtocol? = if managesBackgroundServices {
+            await backgroundSyncLeaseForBackgroundSendIfNeeded()
         } else {
-            false
+            nil
         }
         
         var roomProxy: JoinedRoomProxyProtocol?
@@ -144,7 +144,7 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
             }
         }
         
-        await pauseServicesAfterBackgroundSendIfNeeded(didResumeBackgroundServices)
+        await backgroundSyncLease?.release()
     }
     
     // MARK: - CLLocationManagerDelegate
@@ -325,7 +325,7 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
         let sessions = appSettings.liveLocationSharingSessionsByRoomID
         guard !sessions.isEmpty else { return }
         
-        let didResumeBackgroundServices = await resumeServicesForBackgroundSendIfNeeded()
+        let backgroundSyncLease = await backgroundSyncLeaseForBackgroundSendIfNeeded()
         let geoURI = GeoURI(coordinate: coordinate, uncertainty: nil)
         
         for (roomID, session) in sessions {
@@ -355,7 +355,7 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
             }
         }
         
-        await pauseServicesAfterBackgroundSendIfNeeded(didResumeBackgroundServices)
+        await backgroundSyncLease?.release()
     }
     
     private func resolveRoomProxy(for roomID: String) async -> JoinedRoomProxyProtocol? {
@@ -371,17 +371,10 @@ class LiveLocationManager: NSObject, LiveLocationManagerProtocol, CLLocationMana
         return roomProxy
     }
     
-    private func resumeServicesForBackgroundSendIfNeeded() async -> Bool {
-        guard applicationState() != .active else { return false }
+    private func backgroundSyncLeaseForBackgroundSendIfNeeded() async -> ClientProxyBackgroundSyncLeaseProtocol? {
+        guard applicationState() != .active else { return nil }
         
-        await clientProxy.resumeServices(mode: .backgroundSync)
-        return true
-    }
-    
-    private func pauseServicesAfterBackgroundSendIfNeeded(_ didResumeBackgroundServices: Bool) async {
-        guard didResumeBackgroundServices, applicationState() != .active else { return }
-        
-        await clientProxy.pauseServices(mode: .backgroundGrace)
+        return await clientProxy.acquireBackgroundSyncLease()
     }
     
     private func stopAllSessions() {

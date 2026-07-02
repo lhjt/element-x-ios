@@ -43,6 +43,10 @@ enum ClientProxyMockError: Error {
     case generic
 }
 
+private final class ClientProxyBackgroundSyncLeaseMock: ClientProxyBackgroundSyncLeaseProtocol {
+    func release() async { }
+}
+
 extension ClientProxyMock {
     convenience init(_ configuration: ClientProxyMockConfiguration) {
         self.init()
@@ -169,6 +173,7 @@ extension ClientProxyMock {
     }
     
     private func setDefaultServiceModeClosures() {
+        acquireBackgroundSyncLeaseReturnValue = ClientProxyBackgroundSyncLeaseMock()
         resumeServicesModeClosure = { _ in }
         pauseServicesModeClosure = { _ in }
         updateServiceModeClosure = { _ in }

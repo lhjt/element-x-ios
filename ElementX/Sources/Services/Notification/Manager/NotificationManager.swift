@@ -14,6 +14,7 @@ import UserNotifications
 final class NotificationManager: NSObject, NotificationManagerProtocol {
     private let notificationCenter: UserNotificationCenterProtocol
     private let appSettings: AppSettings
+    private let applicationState: () -> UIApplication.State
     
     private var userSession: UserSessionProtocol?
     
@@ -21,9 +22,11 @@ final class NotificationManager: NSObject, NotificationManagerProtocol {
     private var notificationsEnabled = false
     
     init(notificationCenter: UserNotificationCenterProtocol,
-         appSettings: AppSettings) {
+         appSettings: AppSettings,
+         applicationState: @escaping () -> UIApplication.State = { UIApplication.shared.applicationState }) {
         self.notificationCenter = notificationCenter
         self.appSettings = appSettings
+        self.applicationState = applicationState
         super.init()
     }
     
@@ -163,7 +166,7 @@ final class NotificationManager: NSObject, NotificationManagerProtocol {
     }
     
     private func setPusher(with deviceToken: Data, clientProxy: ClientProxyProtocol) async -> Bool {
-        let didResumeBackgroundServices = await resumeServicesForBackgroundWorkIfNeeded(clientProxy: clientProxy)
+        let backgroundSyncLease = await backgroundSyncLeaseForBackgroundWorkIfNeeded(clientProxy: clientProxy)
         
         do {
             let defaultPayload = APNSPayload(aps: APSInfo(mutableContent: 1,
@@ -181,31 +184,22 @@ final class NotificationManager: NSObject, NotificationManagerProtocol {
                                                         profileTag: pusherProfileTag(),
                                                         lang: Bundle.app.preferredLocalizations.first ?? "en")
             try await clientProxy.setPusher(with: configuration)
-            await pauseServicesAfterBackgroundWorkIfNeeded(didResumeBackgroundServices, clientProxy: clientProxy)
+            await backgroundSyncLease?.release()
             MXLog.info("Set pusher succeeded")
             return true
         } catch {
-            await pauseServicesAfterBackgroundWorkIfNeeded(didResumeBackgroundServices, clientProxy: clientProxy)
+            await backgroundSyncLease?.release()
             MXLog.error("Set pusher failed: \(error)")
             return false
         }
     }
     
-    private func resumeServicesForBackgroundWorkIfNeeded(clientProxy: ClientProxyProtocol) async -> Bool {
-        guard UIApplication.shared.applicationState != .active else {
-            return false
+    private func backgroundSyncLeaseForBackgroundWorkIfNeeded(clientProxy: ClientProxyProtocol) async -> ClientProxyBackgroundSyncLeaseProtocol? {
+        guard applicationState() != .active else {
+            return nil
         }
         
-        await clientProxy.resumeServices(mode: .backgroundSync)
-        return true
-    }
-    
-    private func pauseServicesAfterBackgroundWorkIfNeeded(_ didResumeBackgroundServices: Bool, clientProxy: ClientProxyProtocol) async {
-        guard didResumeBackgroundServices, UIApplication.shared.applicationState != .active else {
-            return
-        }
-        
-        await clientProxy.pauseServices(mode: .backgroundGrace)
+        return await clientProxy.acquireBackgroundSyncLease()
     }
     
     private func pusherProfileTag() -> String {
